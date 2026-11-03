@@ -3,9 +3,6 @@ package dalgo2dynamodb
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -66,86 +63,21 @@ func (c *Client) QueryPartition(ctx context.Context, request QueryRequest) (Quer
 
 func (c *Client) query(o *operation, request QueryRequest) (QueryPage, error) {
 	var result QueryPage
-	if err := validateCapacityMode(request.ReturnConsumedCapacity); err != nil {
-		return result, err
-	}
-	metrics := request.ReturnConsumedCapacity == CapacityTotal || request.ReturnConsumedCapacity == CapacityIndexes
-	table, err := c.table(request.Collection)
+	plan, err := c.compilePartitionQuery(o, request)
 	if err != nil {
 		return result, err
 	}
-	if request.Limit < 1 || request.Limit > c.options.MaxRecords || !keyValue(request.Partition) {
-		return result, failure("query")
-	}
-	partition, err := cloneValue(o, request.Partition, 0)
-	if err != nil {
-		return result, err
-	}
-	values := Item{":p": partition}
-	names := map[string]string{"#p": table.PartitionKey}
-	expression := "#p = :p"
-	var sortCondition *SortCondition
-	if request.Sort != nil {
-		if table.SortKey == "" {
-			return result, failure("query")
-		}
-		operator := request.Sort.Operator
-		count := 1
-		switch operator {
-		case "=", "<", "<=", ">", ">=", "begins_with":
-		case "between":
-			count = 2
-		default:
-			return result, failure("query")
-		}
-		if len(request.Sort.Values) != count {
-			return result, failure("query")
-		}
-		sortCondition = &SortCondition{Operator: operator, Values: make([]types.AttributeValue, count)}
-		for i, value := range request.Sort.Values {
-			if !keyValue(value) {
-				return result, failure("query")
-			}
-			sortCondition.Values[i], err = cloneValue(o, value, 0)
-			if err != nil {
-				return result, err
-			}
-		}
-		if count == 2 {
-			cmp, ok := compareKeyValue(sortCondition.Values[0], sortCondition.Values[1])
-			if !ok || cmp > 0 {
-				return result, failure("query")
-			}
-		}
-		if operator == "begins_with" {
-			switch sortCondition.Values[0].(type) {
-			case *types.AttributeValueMemberS, *types.AttributeValueMemberB:
-			default:
-				return result, failure("query")
-			}
-		}
-		names["#s"] = table.SortKey
-		values[":s0"] = sortCondition.Values[0]
-		switch operator {
-		case "between":
-			values[":s1"] = sortCondition.Values[1]
-			expression += " AND #s BETWEEN :s0 AND :s1"
-		case "begins_with":
-			expression += " AND begins_with(#s, :s0)"
-		default:
-			expression += " AND #s " + operator + " :s0"
-		}
-	}
-	fingerprint := strconv.Itoa(len(request.Collection)) + ":" + request.Collection + "\x00" + expression + "\x00" + keyIdentity(values)
-	if request.Descending {
-		fingerprint += "\x00descending"
-	}
-	if request.ReturnConsumedCapacity != "" {
-		mode := string(request.ReturnConsumedCapacity)
-		fingerprint += "\x00consumed-capacity:" + strconv.Itoa(len(mode)) + ":" + mode
-	}
-	sum := sha256.Sum256([]byte(fingerprint))
-	scope := hex.EncodeToString(sum[:])
+	table := plan.table
+	partition := plan.partition
+	sortCondition := plan.sortCondition
+	expression := plan.expression
+	names := plan.names
+	values := plan.values
+	scope := plan.scope
+	metrics := plan.metrics
+	requestLimit := plan.limit
+	descending := plan.descending
+	mode := plan.mode
 	var cursor Item
 	if request.Cursor != nil {
 		if request.Cursor.owner != c || request.Cursor.scope != scope {
@@ -166,9 +98,9 @@ func (c *Client) query(o *operation, request QueryRequest) (QueryPage, error) {
 		previousSort = cursor[table.SortKey]
 	}
 	if metrics {
-		result.Capacity = &QueryCapacityReceipt{Mode: request.ReturnConsumedCapacity}
+		result.Capacity = &QueryCapacityReceipt{Mode: mode}
 	}
-	forward := !request.Descending
+	forward := !descending
 	for {
 		if err := o.check(); err != nil {
 			return result, err
@@ -176,10 +108,10 @@ func (c *Client) query(o *operation, request QueryRequest) (QueryPage, error) {
 		if result.Pages >= c.options.MaxPages || result.Evaluated >= c.options.MaxEvaluated {
 			return result, failure("limit")
 		}
-		limit := min(request.Limit-len(result.Items), c.options.PageSize, c.options.MaxEvaluated-result.Evaluated)
+		limit := min(requestLimit-len(result.Items), c.options.PageSize, c.options.MaxEvaluated-result.Evaluated)
 		wireLimit := int32(limit)
 		output, err := invoke(o, func(ctx context.Context) (*dynamodb.QueryOutput, error) {
-			return c.api.Query(ctx, &dynamodb.QueryInput{TableName: &table.Name, KeyConditionExpression: &expression, ExpressionAttributeNames: names, ExpressionAttributeValues: values, ExclusiveStartKey: cursor, Limit: &wireLimit, ConsistentRead: &table.ConsistentRead, ScanIndexForward: &forward, ReturnConsumedCapacity: types.ReturnConsumedCapacity(request.ReturnConsumedCapacity)})
+			return c.api.Query(ctx, &dynamodb.QueryInput{TableName: &table.Name, KeyConditionExpression: &expression, ExpressionAttributeNames: names, ExpressionAttributeValues: values, ExclusiveStartKey: cursor, Limit: &wireLimit, ConsistentRead: &table.ConsistentRead, ScanIndexForward: &forward, ReturnConsumedCapacity: types.ReturnConsumedCapacity(mode)})
 		})
 		if err != nil {
 			return result, err
@@ -211,7 +143,7 @@ func (c *Client) query(o *operation, request QueryRequest) (QueryPage, error) {
 			}
 			if previousSort != nil {
 				cmp, ok := compareKeyValue(item[table.SortKey], previousSort)
-				if !ok || (!request.Descending && cmp <= 0) || (request.Descending && cmp >= 0) {
+				if !ok || (!descending && cmp <= 0) || (descending && cmp >= 0) {
 					return result, failure("invalid-response")
 				}
 			}
@@ -238,13 +170,13 @@ func (c *Client) query(o *operation, request QueryRequest) (QueryPage, error) {
 		if table.SortKey != "" {
 			if previousSort != nil {
 				cmp, ok := compareKeyValue(next[table.SortKey], previousSort)
-				if !ok || (!request.Descending && cmp < 0) || (request.Descending && cmp > 0) {
+				if !ok || (!descending && cmp < 0) || (descending && cmp > 0) {
 					return result, failure("invalid-response")
 				}
 			}
 			if len(cursor) > 0 {
 				cmp, ok := compareKeyValue(next[table.SortKey], cursor[table.SortKey])
-				if !ok || (!request.Descending && cmp <= 0) || (request.Descending && cmp >= 0) {
+				if !ok || (!descending && cmp <= 0) || (descending && cmp >= 0) {
 					return result, failure("cursor")
 				}
 			}
@@ -255,7 +187,7 @@ func (c *Client) query(o *operation, request QueryRequest) (QueryPage, error) {
 			return result, failure("cursor")
 		}
 		seenCursors[identity] = true
-		if len(result.Items) == request.Limit {
+		if len(result.Items) == requestLimit {
 			result.Next = &Cursor{owner: c, scope: scope, key: next}
 			return result, o.check()
 		}

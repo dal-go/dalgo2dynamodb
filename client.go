@@ -44,6 +44,7 @@ type Options struct {
 	MaxPages       int
 	MaxEvaluated   int
 	PageSize       int
+	Journeys       *JourneyOptions
 }
 
 // Error has a safe, fixed code and never wraps provider errors or signal causes.
@@ -62,6 +63,7 @@ type Client struct {
 	life      context.Context
 	cancel    context.CancelFunc
 	once      sync.Once
+	registry  readJourneyRegistry
 }
 
 // New does no credential, network, table discovery or schema I/O.
@@ -101,6 +103,11 @@ func New(api API, options Options) (*Client, error) {
 		tables[collection] = table
 	}
 	options.Tables = tables
+	journeys, err := copyJourneyOptions(options.Journeys, tables)
+	if err != nil {
+		return nil, err
+	}
+	options.Journeys = journeys
 	life, cancel := context.WithCancel(context.Background())
 	return &Client{api: api, options: options, semaphore: make(chan struct{}, options.MaxConcurrent), life: life, cancel: cancel}, nil
 }
@@ -109,15 +116,25 @@ func validName(s string) bool { return s != "" && len(s) <= 255 && utf8.ValidStr
 
 // Close stops new admissions and cancels active SDK contexts, idempotently.
 // It cannot force an uncooperative borrowed SDK to return, and never closes it.
-func (c *Client) Close() error { c.once.Do(c.cancel); return nil }
+func (c *Client) Close() error {
+	c.once.Do(func() {
+		c.closeReadJourneys()
+		c.cancel()
+	})
+	return nil
+}
 
 type operation struct {
-	client *Client
-	ctx    context.Context
-	cancel context.CancelFunc
-	stop   func() bool
-	bytes  int
-	nodes  int
+	client    *Client
+	ctx       context.Context
+	cancel    context.CancelFunc
+	stop      func() bool
+	retain    func() (func(), error)
+	bytes     int
+	nodes     int
+	byteLimit int
+	nodeLimit int
+	once      sync.Once
 }
 
 func (c *Client) begin(ctx context.Context) (*operation, error) {
@@ -161,12 +178,23 @@ func (o *operation) check() error {
 	}
 	return nil
 }
-func (o *operation) close() { o.stop(); o.cancel() }
+func (o *operation) close() {
+	o.once.Do(func() {
+		o.stop()
+		o.cancel()
+	})
+}
 func (o *operation) charge(n int) error {
 	if err := o.check(); err != nil {
 		return err
 	}
 	if n < 0 || n > o.client.options.MaxParsedBytes-o.bytes {
+		return failure("limit")
+	}
+	if o.byteLimit > 0 && n > o.byteLimit-o.bytes {
+		return failure("limit")
+	}
+	if o.nodeLimit > 0 && o.nodes >= o.nodeLimit {
 		return failure("limit")
 	}
 	o.bytes += n
@@ -196,9 +224,32 @@ func invoke[T any](o *operation, call func(context.Context) (T, error)) (T, erro
 		<-o.client.semaphore
 		return zero, err
 	}
+	release := func() {}
+	if o.retain != nil {
+		var err error
+		release, err = o.retain()
+		if err != nil {
+			<-o.client.semaphore
+			if checkErr := o.check(); checkErr != nil {
+				return zero, checkErr
+			}
+			return zero, err
+		}
+		if release == nil {
+			release = func() {}
+		}
+	}
+	if err := o.check(); err != nil {
+		release()
+		<-o.client.semaphore
+		return zero, err
+	}
 	done := make(chan completion[T], 1)
 	go func() {
 		value, err := call(o.ctx)
+		// Retained until the borrowed SDK actually returns, even if the caller
+		// already gave up, so no logical charge is released while it still runs.
+		release()
 		// No public callbacks or result mutation after caller cancellation.
 		<-o.client.semaphore
 		done <- completion[T]{value: value, err: err}
