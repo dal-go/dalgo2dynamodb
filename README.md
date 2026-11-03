@@ -42,6 +42,20 @@ mapping, query and direction; it cannot be decoded from caller-controlled JSON.
 Each explicit continuation call has its own bounded operation, not a global
 snapshot or unlimited whole-journey guarantee.
 
+`QueryRequest.ReturnConsumedCapacity` is an optional exact selector. Omitted and
+`NONE` preserve the legacy result shape and return no capacity report (`NONE` is
+still transmitted verbatim). `TOTAL` and `INDEXES` add a per-public-call
+`QueryPage.Capacity` receipt built only from the official SDK's decoded `float64`
+observations of each native page. Explicit zero stays present while a missing
+metric, table or index map stays missing; per-metric
+coverage and raw `ScannedCount` are reported next to the legacy `Evaluated` count.
+Index and table components are not added into the top-level metric totals, and raw
+item `N`/`NS` values remain lossless. The receipt is not an original-journey total,
+a billing hard cap, a refund or failure ledger, or AWS/IAM proof. Explicit Scan and
+original-scope capacity accounting remain **NOT_IMPLEMENTED** for a subsequent task
+(neither `UNSUPPORTED` nor complete). Normal branch publication is pending and is
+not a registry release.
+
 The sealed `client.DB()` DALgo facade supports Get/Exists/GetMulti. A string
 record ID addresses a table with a string partition key and no sort key.
 Composite/native keys use `record.NewKeyWithFields` and `record.FieldVal` values

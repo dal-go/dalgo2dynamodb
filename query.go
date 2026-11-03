@@ -26,6 +26,9 @@ type QueryRequest struct {
 	Limit      int
 	Descending bool
 	Cursor     *Cursor
+	// ReturnConsumedCapacity optionally requests per-native-page capacity
+	// metrics; the zero value preserves the original wire request.
+	ReturnConsumedCapacity CapacityMode
 }
 
 // Cursor is an opaque, immutable in-process continuation. It is bound to the
@@ -41,6 +44,8 @@ type QueryPage struct {
 	Next      *Cursor
 	Pages     int
 	Evaluated int
+	// Capacity is nil unless TOTAL or INDEXES was explicitly requested.
+	Capacity *QueryCapacityReceipt `json:"Capacity,omitempty"`
 }
 
 func (c *Client) QueryPartition(ctx context.Context, request QueryRequest) (QueryPage, error) {
@@ -61,6 +66,10 @@ func (c *Client) QueryPartition(ctx context.Context, request QueryRequest) (Quer
 
 func (c *Client) query(o *operation, request QueryRequest) (QueryPage, error) {
 	var result QueryPage
+	if err := validateCapacityMode(request.ReturnConsumedCapacity); err != nil {
+		return result, err
+	}
+	metrics := request.ReturnConsumedCapacity == CapacityTotal || request.ReturnConsumedCapacity == CapacityIndexes
 	table, err := c.table(request.Collection)
 	if err != nil {
 		return result, err
@@ -131,6 +140,10 @@ func (c *Client) query(o *operation, request QueryRequest) (QueryPage, error) {
 	if request.Descending {
 		fingerprint += "\x00descending"
 	}
+	if request.ReturnConsumedCapacity != "" {
+		mode := string(request.ReturnConsumedCapacity)
+		fingerprint += "\x00consumed-capacity:" + strconv.Itoa(len(mode)) + ":" + mode
+	}
 	sum := sha256.Sum256([]byte(fingerprint))
 	scope := hex.EncodeToString(sum[:])
 	var cursor Item
@@ -152,6 +165,9 @@ func (c *Client) query(o *operation, request QueryRequest) (QueryPage, error) {
 	if len(cursor) > 0 && table.SortKey != "" {
 		previousSort = cursor[table.SortKey]
 	}
+	if metrics {
+		result.Capacity = &QueryCapacityReceipt{Mode: request.ReturnConsumedCapacity}
+	}
 	forward := !request.Descending
 	for {
 		if err := o.check(); err != nil {
@@ -163,13 +179,18 @@ func (c *Client) query(o *operation, request QueryRequest) (QueryPage, error) {
 		limit := min(request.Limit-len(result.Items), c.options.PageSize, c.options.MaxEvaluated-result.Evaluated)
 		wireLimit := int32(limit)
 		output, err := invoke(o, func(ctx context.Context) (*dynamodb.QueryOutput, error) {
-			return c.api.Query(ctx, &dynamodb.QueryInput{TableName: &table.Name, KeyConditionExpression: &expression, ExpressionAttributeNames: names, ExpressionAttributeValues: values, ExclusiveStartKey: cursor, Limit: &wireLimit, ConsistentRead: &table.ConsistentRead, ScanIndexForward: &forward})
+			return c.api.Query(ctx, &dynamodb.QueryInput{TableName: &table.Name, KeyConditionExpression: &expression, ExpressionAttributeNames: names, ExpressionAttributeValues: values, ExclusiveStartKey: cursor, Limit: &wireLimit, ConsistentRead: &table.ConsistentRead, ScanIndexForward: &forward, ReturnConsumedCapacity: types.ReturnConsumedCapacity(request.ReturnConsumedCapacity)})
 		})
 		if err != nil {
 			return result, err
 		}
 		if output == nil || len(output.Items) > limit || output.Count != int32(len(output.Items)) || output.ScannedCount < output.Count || output.ScannedCount > wireLimit {
 			return result, failure("invalid-response")
+		}
+		if metrics {
+			if err := appendQueryCapacity(o, result.Capacity, table.Name, result.Pages+1, output.ScannedCount, output.ConsumedCapacity); err != nil {
+				return result, err
+			}
 		}
 		result.Pages++
 		result.Evaluated += max(1, int(output.ScannedCount))
