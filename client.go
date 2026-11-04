@@ -58,6 +58,7 @@ func failure(code string) error { return &Error{Code: code} }
 // bounds outstanding SDK calls, rather than creating unlimited detached work.
 type Client struct {
 	api       API
+	scanAPI   ScanAPI
 	options   Options
 	semaphore chan struct{}
 	life      context.Context
@@ -109,7 +110,8 @@ func New(api API, options Options) (*Client, error) {
 	}
 	options.Journeys = journeys
 	life, cancel := context.WithCancel(context.Background())
-	return &Client{api: api, options: options, semaphore: make(chan struct{}, options.MaxConcurrent), life: life, cancel: cancel}, nil
+	scanAPI, _ := api.(ScanAPI)
+	return &Client{api: api, scanAPI: scanAPI, options: options, semaphore: make(chan struct{}, options.MaxConcurrent), life: life, cancel: cancel}, nil
 }
 
 func validName(s string) bool { return s != "" && len(s) <= 255 && utf8.ValidString(s) }

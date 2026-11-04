@@ -52,11 +52,21 @@ func (c *Client) stageQueryJourneyPage(o *operation, cursor *ReadCursor, state *
 		previousCancel()
 	}
 
-	page, err := c.fetchQueryJourneyNativePage(o, state.plan, state.key, int32(res.limit))
+	var page queryJourneyNativePage
+	var progress [][32]byte
+	if state.scan {
+		page, err = c.fetchScanJourneyNativePage(o, scanJourneyPlan{common: state.plan, evaluatedLimit: state.evaluatedLimit}, state.key, int32(res.limit))
+	} else {
+		page, err = c.fetchQueryJourneyNativePage(o, state.plan, state.key, int32(res.limit))
+	}
 	if err != nil {
 		return c.failQueryJourneyPage(cursor, state, o.bytes, o.nodes, queryJourneyPagePriority(o, err))
 	}
-	progress, err := validateQueryJourneyProgress(o, state.plan, state.key, state.seen, page)
+	if state.scan {
+		progress, err = validateScanJourneyProgress(o, state.key, state.seen, page)
+	} else {
+		progress, err = validateQueryJourneyProgress(o, state.plan, state.key, state.seen, page)
+	}
 	if err != nil {
 		return c.failQueryJourneyPage(cursor, state, o.bytes, o.nodes, queryJourneyPagePriority(o, err))
 	}

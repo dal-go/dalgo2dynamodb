@@ -25,24 +25,26 @@ type queryJourneyCapacity struct {
 }
 
 type queryJourneyState struct {
-	plan        partitionQueryPlan
-	expires     time.Time
-	bytes       int
-	nodes       int
-	terminal    bool
-	logical     int
-	physical    int
-	work        queryJourneyAccounting
-	pending     *queryJourneyNativePage
-	reservation *queryJourneyReservation
-	current     *ReadCursor
-	key         Item
-	seen        map[[32]byte]struct{}
-	keyCost     queryJourneyCharge
-	pendingCost queryJourneyCharge
-	historyCost queryJourneyCharge
-	capacity    queryJourneyCapacity
-	attempts    int
+	plan           partitionQueryPlan
+	expires        time.Time
+	bytes          int
+	nodes          int
+	terminal       bool
+	logical        int
+	physical       int
+	work           queryJourneyAccounting
+	pending        *queryJourneyNativePage
+	reservation    *queryJourneyReservation
+	current        *ReadCursor
+	key            Item
+	seen           map[[32]byte]struct{}
+	keyCost        queryJourneyCharge
+	pendingCost    queryJourneyCharge
+	historyCost    queryJourneyCharge
+	capacity       queryJourneyCapacity
+	attempts       int
+	scan           bool
+	evaluatedLimit int
 }
 
 type readJourneyRegistry struct {
@@ -89,57 +91,88 @@ func (c *Client) OpenQueryJourney(ctx context.Context, request QueryRequest) (*R
 	if err != nil {
 		return nil, c.openJourneyFailure(ctx, o, err)
 	}
+	return c.openJourneyCommon(ctx, o, plan, expires, callerDone, callerDeadline, hasCallerDeadline, false, 0)
+}
+
+// openJourneyCommon performs the shared, already-reviewed admission and final
+// owned registration for one journey, after the caller has validated mode,
+// compiled the plan and captured the original expiry and caller fields. It
+// closes o before fresh classification or commit, keeps the query charge
+// unchanged and adds only the private scan/evaluatedLimit state for a Scan
+// journey.
+func (c *Client) openJourneyCommon(ctx context.Context, o *operation, plan partitionQueryPlan, expires time.Time, callerDone <-chan struct{}, callerDeadline time.Time, hasCallerDeadline bool, scan bool, evaluatedLimit int) (*ReadCursor, error) {
+	profile := c.options.Journeys
 	bytes, nodes := journeyCharge(&plan, profile, o)
+	if scan {
+		bytes += 64
+		nodes++
+	}
 	work := queryJourneyAccounting{parsedBytes: o.bytes, parsedNodes: o.nodes}
 	o.close()
 
 	if err := active(ctx); err != nil {
-		return nil, err
+		return nil, c.openJourneyFailure(ctx, o, err)
 	}
 	now := time.Now()
 	if !now.Before(expires) {
-		return nil, context.DeadlineExceeded
+		return nil, c.openJourneyFailure(ctx, o, context.DeadlineExceeded)
 	}
 	if c.life.Err() != nil {
-		return nil, failure("closed")
+		return nil, c.openJourneyFailure(ctx, o, failure("closed"))
 	}
 
-	reg := &c.registry
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-	now = time.Now()
-	c.pruneReadJourneysLocked(now)
-	if reg.closed || c.life.Err() != nil {
-		return nil, failure("closed")
-	}
-	if !now.Before(expires) {
-		return nil, context.DeadlineExceeded
-	}
-	select {
-	case <-callerDone:
-		if hasCallerDeadline && !time.Now().Before(callerDeadline) {
+	cursor, err := func() (*ReadCursor, error) {
+		reg := &c.registry
+		reg.mu.Lock()
+		defer reg.mu.Unlock()
+		now := time.Now()
+		c.pruneReadJourneysLocked(now)
+		if reg.closed || c.life.Err() != nil {
+			return nil, failure("closed")
+		}
+		if !now.Before(expires) {
 			return nil, context.DeadlineExceeded
 		}
-		return nil, context.Canceled
-	default:
+		select {
+		case <-callerDone:
+			if hasCallerDeadline && !time.Now().Before(callerDeadline) {
+				return nil, context.DeadlineExceeded
+			}
+			return nil, context.Canceled
+		default:
+		}
+		if len(reg.open) >= profile.MaxOpen {
+			return nil, failure("limit")
+		}
+		if bytes < 0 || nodes < 1 || bytes > profile.MaxRetainedBytes-reg.bytes || nodes > profile.MaxRetainedNodes-reg.nodes {
+			return nil, failure("limit")
+		}
+		if !time.Now().Before(expires) {
+			return nil, context.DeadlineExceeded
+		}
+		if reg.open == nil {
+			reg.open = make(map[*ReadCursor]*queryJourneyState, profile.MaxOpen)
+		}
+		cursor := &ReadCursor{owner: c}
+		reg.open[cursor] = &queryJourneyState{plan: plan, expires: expires, bytes: bytes, nodes: nodes, work: work, current: cursor, scan: scan, evaluatedLimit: evaluatedLimit}
+		reg.bytes += bytes
+		reg.nodes += nodes
+		return cursor, nil
+	}()
+	if err != nil {
+		return nil, c.openJourneyFailure(ctx, o, err)
 	}
-	if len(reg.open) >= profile.MaxOpen {
-		return nil, failure("limit")
-	}
-	if bytes < 0 || nodes < 1 || bytes > profile.MaxRetainedBytes-reg.bytes || nodes > profile.MaxRetainedNodes-reg.nodes {
-		return nil, failure("limit")
-	}
-	if !time.Now().Before(expires) {
-		return nil, context.DeadlineExceeded
-	}
-	if reg.open == nil {
-		reg.open = make(map[*ReadCursor]*queryJourneyState, profile.MaxOpen)
-	}
-	cursor := &ReadCursor{owner: c}
-	reg.open[cursor] = &queryJourneyState{plan: plan, expires: expires, bytes: bytes, nodes: nodes, work: work, current: cursor}
-	reg.bytes += bytes
-	reg.nodes += nodes
 	return cursor, nil
+}
+
+// readJourneyEvaluatedLimit returns the journey's admitted evaluated-item
+// ceiling. A Query journey keeps the configured global cap; a Scan journey uses
+// its explicit request ceiling without ever raising it.
+func (c *Client) readJourneyEvaluatedLimit(state *queryJourneyState) int {
+	if state.scan {
+		return state.evaluatedLimit
+	}
+	return c.options.MaxEvaluated
 }
 
 // openJourneyFailure completes owned cleanup before classifying a failed open.

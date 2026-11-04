@@ -56,7 +56,7 @@ func (c *Client) reserveQueryJourneyPage(cursor *ReadCursor, state *queryJourney
 	}
 	remainingRows := int(state.plan.limit) - state.work.receivedRows
 	remainingPages := c.options.MaxPages - state.work.fetchedPages
-	remainingWork := c.options.MaxEvaluated - state.work.logicalWork
+	remainingWork := c.readJourneyEvaluatedLimit(state) - state.work.logicalWork
 	if remainingRows < 1 || remainingPages < 1 || remainingWork < 1 {
 		return nil, failure("limit")
 	}

@@ -65,7 +65,7 @@ func (c *Client) NextReadPageWith(ctx context.Context, cursor *ReadCursor, prepa
 	} else if state.work.receivedRows == int(state.plan.limit) {
 		stop = ReadStopRequestedRowLimit
 	} else {
-		if state.work.fetchedPages >= c.options.MaxPages || state.work.logicalWork >= c.options.MaxEvaluated {
+		if state.work.fetchedPages >= c.options.MaxPages || state.work.logicalWork >= c.readJourneyEvaluatedLimit(state) {
 			return c.failQueryJourneyDelivery(ctx, o, cursor, state, nil, failure("limit"), true)
 		}
 		fits, err := nextQueryJourneyCallFits(c, state, profile)
